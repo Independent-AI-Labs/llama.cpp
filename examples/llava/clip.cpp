@@ -58,6 +58,9 @@
 #   define LOG_DBG(...) do { fprintf(stdout, __VA_ARGS__); } while (0)
 #endif // defined(LLAVA_LOG_OFF)
 
+// Function to print debug messages only when debug flag is set
+#define DEBUG_PRINT_CLIP(params, ...) do { if ((params)->debug) { fprintf(stderr, "[DEBUG CLIP] "); fprintf(stderr, __VA_ARGS__); } } while (0)
+
 //#define CLIP_DEBUG_FUNCTIONS
 
 // RGB uint8 image

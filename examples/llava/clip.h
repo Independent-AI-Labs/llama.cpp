@@ -40,6 +40,7 @@ struct clip_image_f32_batch {
 };
 
 CLIP_API struct clip_ctx * clip_model_load    (const char * fname, int verbosity);
+CLIP_API struct clip_ctx * clip_model_load_with_debug    (const char * fname, int verbosity);
 CLIP_API struct clip_ctx * clip_model_load_cpu(const char * fname, int verbosity);
 
 CLIP_API void clip_free(struct clip_ctx * ctx);
