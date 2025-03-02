@@ -140,7 +140,7 @@ def main(args):
     fout.add_name(model_name)
     """
     HACK: Since vision rope related parameter aren't stored in the `Qwen2VLConfig,
-            it will be hardcoded in the `clip_image_build_graph` from `clip.cpp`.
+            it will be hardcoded in the `clip_image_build_graph` from `clip-debug.cpp`.
     """
 
     if local_model:

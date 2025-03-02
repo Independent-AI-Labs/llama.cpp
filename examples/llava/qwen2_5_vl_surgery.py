@@ -39,7 +39,7 @@ def to_gguf_name(name: str) -> str:
     if "weight_g" in name:
         name = name.replace("weight_g", "weight")
 
-    # Special handling for merger tensors to match clip.cpp expectations
+    # Special handling for merger tensors to match clip-debug.cpp expectations
     if "merger.mlp" in name:
         # Extract the layer number
         parts = name.split(".")
@@ -47,7 +47,7 @@ def to_gguf_name(name: str) -> str:
             if part == "mlp" and i + 1 < len(parts):
                 layer_num = parts[i + 1]
                 # Map the merger layers to the expected GGUF tensor names
-                # Note: clip.cpp looks for mm.0.* and mm.2.* (not mm.1.*)
+                # Note: clip-debug.cpp looks for mm.0.* and mm.2.* (not mm.1.*)
                 if layer_num == "0":
                     name = name.replace(f"merger.mlp.{layer_num}", "mm.0")
                 elif layer_num == "1":
