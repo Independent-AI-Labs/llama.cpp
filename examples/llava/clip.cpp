@@ -177,6 +177,11 @@ static std::string format(const char * fmt, ...) {
 #define TN_GLM_BOI_W "adapter.boi"
 #define TN_GLM_EOI_W "adapter.eoi"
 
+// Tensor name constants for Qwen2.5
+#define TN_FFN_GATE      "%s.blk.%d.ffn_gate.%s"
+#define TN_FFN_UP        "%s.blk.%d.ffn_up.%s"
+#define TN_FFN_DOWN      "%s.blk.%d.ffn_down.%s"
+
 
 enum projector_type {
     PROJECTOR_TYPE_MLP,
@@ -472,12 +477,16 @@ struct clip_layer {
     struct ggml_tensor * ln_1_w;
     struct ggml_tensor * ln_1_b;
 
-    // ff
+    // ff - For standard models these are down_proj and up_proj
+    // For Qwen2.5 models these are used differently (see below)
     struct ggml_tensor * ff_i_w;
     struct ggml_tensor * ff_i_b;
-
     struct ggml_tensor * ff_o_w;
     struct ggml_tensor * ff_o_b;
+
+    // Specific for Qwen2.5 gated MLP
+    struct ggml_tensor * ff_gate_w;
+    struct ggml_tensor * ff_gate_b;
 
     // layernorm 2
     struct ggml_tensor * ln_2_w;
@@ -862,9 +871,15 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         // For Qwen2.5, the MLP uses SiLU gated activation
         if (ctx->is_qwen2_5) {
             // Qwen2.5 uses SiLU gated activation
-            // ffn_down is the gate_proj, ffn_up is the up_proj
-            struct ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
-            struct ggml_tensor * up = ggml_mul_mat(ctx0, model.layers[il].ff_i_b, cur); // using ff_i_b as up_proj weight
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, model.layers[il].ff_gate_w, cur);
+            if (model.layers[il].ff_gate_b) {
+                gate = ggml_add(ctx0, gate, ggml_repeat(ctx0, model.layers[il].ff_gate_b, gate));
+            }
+
+            struct ggml_tensor * up = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
+            if (model.layers[il].ff_i_b) {
+                up = ggml_add(ctx0, up, ggml_repeat(ctx0, model.layers[il].ff_i_b, up));
+            }
 
             // Apply SiLU to the gate
             gate = ggml_silu_inplace(ctx0, gate);
@@ -874,10 +889,13 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
 
             // Apply down projection
             cur = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
+            if (model.layers[il].ff_o_b) {
+                cur = ggml_add(ctx0, cur, ggml_repeat(ctx0, model.layers[il].ff_o_b, cur));
+            }
         } else {
-            // Original MLP
+            // Original MLP implementation for standard models
             cur = ggml_mul_mat(ctx0, model.layers[il].ff_i_w, cur);
-            cur = ggml_add(ctx0, cur, model.layers[il].ff_i_b);
+            cur = ggml_add(ctx0, cur, ggml_repeat(ctx0, model.layers[il].ff_i_b, cur));
 
             if (ctx->use_gelu) {
                 cur = ggml_gelu_inplace(ctx0, cur);
@@ -888,7 +906,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             }
 
             cur = ggml_mul_mat(ctx0, model.layers[il].ff_o_w, cur);
-            cur = ggml_add(ctx0, cur, model.layers[il].ff_o_b);
+            cur = ggml_add(ctx0, cur, ggml_repeat(ctx0, model.layers[il].ff_o_b, cur));
         }
 
         // residual 2
@@ -1358,50 +1376,50 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
     }
 
     DEBUG_PRINT_CLIP("Initializing backend\n");
-#ifdef GGML_USE_CUDA
-    new_clip->backend = ggml_backend_cuda_init(0);
-    DEBUG_PRINT_CLIP("Attempting to initialize CUDA backend\n");
-    if (new_clip->backend) {
-        DEBUG_PRINT_CLIP("Successfully initialized CUDA backend\n");
-    }
-    LOG_INF("%s: CLIP using CUDA backend\n", __func__);
-#endif
+    #ifdef GGML_USE_CUDA
+        new_clip->backend = ggml_backend_cuda_init(0);
+        DEBUG_PRINT_CLIP("Attempting to initialize CUDA backend\n");
+        if (new_clip->backend) {
+            DEBUG_PRINT_CLIP("Successfully initialized CUDA backend\n");
+        }
+        LOG_INF("%s: CLIP using CUDA backend\n", __func__);
+    #endif
 
-#ifdef GGML_USE_METAL
-    new_clip->backend = ggml_backend_metal_init();
-    DEBUG_PRINT_CLIP("Attempting to initialize Metal backend\n");
-    if (new_clip->backend) {
-        DEBUG_PRINT_CLIP("Successfully initialized Metal backend\n");
-    }
-    LOG_INF("%s: CLIP using Metal backend\n", __func__);
-#endif
+    #ifdef GGML_USE_METAL
+        new_clip->backend = ggml_backend_metal_init();
+        DEBUG_PRINT_CLIP("Attempting to initialize Metal backend\n");
+        if (new_clip->backend) {
+            DEBUG_PRINT_CLIP("Successfully initialized Metal backend\n");
+        }
+        LOG_INF("%s: CLIP using Metal backend\n", __func__);
+    #endif
 
-#ifdef GGML_USE_CANN
-    new_clip->backend = ggml_backend_cann_init(0);
-    DEBUG_PRINT_CLIP("Attempting to initialize CANN backend\n");
-    if (new_clip->backend) {
-        DEBUG_PRINT_CLIP("Successfully initialized CANN backend\n");
-    }
-    LOG_INF("%s: CLIP using CANN backend\n", __func__);
-#endif
+    #ifdef GGML_USE_CANN
+        new_clip->backend = ggml_backend_cann_init(0);
+        DEBUG_PRINT_CLIP("Attempting to initialize CANN backend\n");
+        if (new_clip->backend) {
+            DEBUG_PRINT_CLIP("Successfully initialized CANN backend\n");
+        }
+        LOG_INF("%s: CLIP using CANN backend\n", __func__);
+    #endif
 
-#ifdef GGML_USE_VULKAN
-    new_clip->backend = ggml_backend_vk_init(0);
-    DEBUG_PRINT_CLIP("Attempting to initialize Vulkan backend\n");
-    if (new_clip->backend) {
-        DEBUG_PRINT_CLIP("Successfully initialized Vulkan backend\n");
-    }
-    LOG_INF("%s: CLIP using Vulkan backend\n", __func__);
-#endif
+    #ifdef GGML_USE_VULKAN
+        new_clip->backend = ggml_backend_vk_init(0);
+        DEBUG_PRINT_CLIP("Attempting to initialize Vulkan backend\n");
+        if (new_clip->backend) {
+            DEBUG_PRINT_CLIP("Successfully initialized Vulkan backend\n");
+        }
+        LOG_INF("%s: CLIP using Vulkan backend\n", __func__);
+    #endif
 
-#ifdef GGML_USE_SYCL
-    new_clip->backend = ggml_backend_sycl_init(0);
-    DEBUG_PRINT_CLIP("Attempting to initialize SYCL backend\n");
-    if (new_clip->backend) {
-        DEBUG_PRINT_CLIP("Successfully initialized SYCL backend\n");
-    }
-    LOG_INF("%s: CLIP using SYCL backend\n", __func__);
-#endif
+    #ifdef GGML_USE_SYCL
+        new_clip->backend = ggml_backend_sycl_init(0);
+        DEBUG_PRINT_CLIP("Attempting to initialize SYCL backend\n");
+        if (new_clip->backend) {
+            DEBUG_PRINT_CLIP("Successfully initialized SYCL backend\n");
+        }
+        LOG_INF("%s: CLIP using SYCL backend\n", __func__);
+    #endif
 
     if (!new_clip->backend) {
         new_clip->backend = ggml_backend_cpu_init();
@@ -1451,10 +1469,15 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         }
         // GGML_ASSERT(new_clip->has_llava_projector); // see monatis/clip.cpp for image and/or text encoding for semantic search
 
-        idx = gguf_find_key(ctx, KEY_IS_QWEN2_5);
-        if (idx != -1) {
-            new_clip->is_qwen2_5 = gguf_get_val_bool(ctx, idx);
-            DEBUG_PRINT_CLIP("is_qwen2_5: %d\n", new_clip->is_qwen2_5);
+        try {
+            idx = gguf_find_key(ctx, KEY_IS_QWEN2_5);
+            if (idx != -1) {
+                new_clip->is_qwen2_5 = gguf_get_val_bool(ctx, idx);
+                DEBUG_PRINT_CLIP("is_qwen2_5: %d\n", new_clip->is_qwen2_5);
+            }
+        } catch (std::runtime_error & /*e*/) {
+            new_clip->is_qwen2_5 = false;
+            DEBUG_PRINT_CLIP("is_qwen2_5 not found, defaulting to false\n");
         }
 
         GGML_ASSERT(new_clip->has_vision_encoder);
@@ -1872,24 +1895,87 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         for (int il = 0; il < hparams.n_layer; ++il) {
             DEBUG_PRINT_CLIP("Loading vision model layer %d\n", il);
             auto & layer = vision_model.layers[il];
-            layer.k_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_K,      "v", il, "weight"));
-            layer.q_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q,      "v", il, "weight"));
-            layer.v_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_V,      "v", il, "weight"));
-            layer.o_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_OUTPUT, "v", il, "weight"));
-            layer.ln_1_w = get_tensor(new_clip->ctx_data, format(TN_LN_1,        "v", il, "weight"));
-            layer.ln_2_w = get_tensor(new_clip->ctx_data, format(TN_LN_2,        "v", il, "weight"));
-            layer.ff_i_w = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN,    "v", il, "weight"));
-            layer.ff_o_w = get_tensor(new_clip->ctx_data, format(TN_FFN_UP,      "v", il, "weight"));
-            layer.k_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_K,      "v", il, "bias"));
-            layer.q_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q,      "v", il, "bias"));
-            layer.v_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_V,      "v", il, "bias"));
-            layer.o_b    = get_tensor(new_clip->ctx_data, format(TN_ATTN_OUTPUT, "v", il, "bias"));
-            layer.ln_1_b = get_tensor(new_clip->ctx_data, format(TN_LN_1,        "v", il, "bias"));
-            layer.ln_2_b = get_tensor(new_clip->ctx_data, format(TN_LN_2,        "v", il, "bias"));
-            layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN,    "v", il, "bias"));
-            layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP,      "v", il, "bias"));
+
+            // Initialize all tensor pointers to NULL
+            layer.k_w = layer.k_b = layer.q_w = layer.q_b = layer.v_w = layer.v_b = NULL;
+            layer.o_w = layer.o_b = NULL;
+            layer.ln_1_w = layer.ln_1_b = layer.ln_2_w = layer.ln_2_b = NULL;
+            layer.ff_i_w = layer.ff_i_b = layer.ff_o_w = layer.ff_o_b = NULL;
+            layer.ff_gate_w = layer.ff_gate_b = NULL;
+
+            // Common tensors for all model types
+            layer.ln_1_w = get_tensor(new_clip->ctx_data, format(TN_LN_1, "v", il, "weight"));
+            layer.ln_2_w = get_tensor(new_clip->ctx_data, format(TN_LN_2, "v", il, "weight"));
+
+            layer.q_w = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q, "v", il, "weight"));
+            layer.k_w = get_tensor(new_clip->ctx_data, format(TN_ATTN_K, "v", il, "weight"));
+            layer.v_w = get_tensor(new_clip->ctx_data, format(TN_ATTN_V, "v", il, "weight"));
+            layer.o_w = get_tensor(new_clip->ctx_data, format(TN_ATTN_OUTPUT, "v", il, "weight"));
+
+            layer.q_b = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q, "v", il, "bias"));
+            layer.k_b = get_tensor(new_clip->ctx_data, format(TN_ATTN_K, "v", il, "bias"));
+            layer.v_b = get_tensor(new_clip->ctx_data, format(TN_ATTN_V, "v", il, "bias"));
+            layer.o_b = get_tensor(new_clip->ctx_data, format(TN_ATTN_OUTPUT, "v", il, "bias"));
+
+            // Model-specific tensors
+            if (new_clip->is_qwen2_5) {
+                // Qwen2.5 has no layer norm biases (RMSNorm)
+                layer.ln_1_b = NULL;
+                layer.ln_2_b = NULL;
+
+                // Qwen2.5 specific gated MLP tensors
+                try {
+                    layer.ff_gate_w = get_tensor(new_clip->ctx_data, format(TN_FFN_GATE, "v", il, "weight"));
+                    layer.ff_gate_b = get_tensor(new_clip->ctx_data, format(TN_FFN_GATE, "v", il, "bias"));
+                    layer.ff_i_w = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "weight"));
+                    layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "bias"));
+                    layer.ff_o_w = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "weight"));
+                    layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "bias"));
+
+                    DEBUG_PRINT_CLIP("Loaded Qwen2.5 gated MLP tensors for layer %d\n", il);
+                } catch (std::exception & e) {
+                    // Fall back to standard tensor names if the gated ones aren't found
+                    LOG_ERR("Failed to load Qwen2.5 gated MLP tensors: %s\n", e.what());
+                    layer.ff_i_w = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "weight"));
+                    layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "bias"));
+                    layer.ff_o_w = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "weight"));
+                    layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "bias"));
+                }
+            } else {
+                // Standard models
+                layer.ln_1_b = get_tensor(new_clip->ctx_data, format(TN_LN_1, "v", il, "bias"));
+                layer.ln_2_b = get_tensor(new_clip->ctx_data, format(TN_LN_2, "v", il, "bias"));
+
+                layer.ff_i_w = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "weight"));
+                layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN, "v", il, "bias"));
+                layer.ff_o_w = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "weight"));
+                layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP, "v", il, "bias"));
+            }
+
+            // Verify that all required tensors were loaded
+            if (!layer.q_w || !layer.k_w || !layer.v_w || !layer.o_w) {
+                LOG_ERR("%s: failed to load attention weights for layer %d\n", __func__, il);
+                return nullptr;
+            }
+
+            if (!layer.ln_1_w || !layer.ln_2_w) {
+                LOG_ERR("%s: failed to load layer norm weights for layer %d\n", __func__, il);
+                return nullptr;
+            }
+
+            if (new_clip->is_qwen2_5) {
+                if (!layer.ff_gate_w || !layer.ff_i_w || !layer.ff_o_w) {
+                    LOG_ERR("%s: failed to load Qwen2.5 MLP weights for layer %d\n", __func__, il);
+                    return nullptr;
+                }
+            } else {
+                if (!layer.ff_i_w || !layer.ff_o_w) {
+                    LOG_ERR("%s: failed to load MLP weights for layer %d\n", __func__, il);
+                    return nullptr;
+                }
+            }
         }
-        DEBUG_PRINT_CLIP("Successfully loaded all vision model layers\n");
+
     }
 
     DEBUG_PRINT_CLIP("Freeing metadata context\n");
@@ -1915,6 +2001,12 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
 
     DEBUG_PRINT_CLIP("Successfully loaded CLIP model from %s\n", fname);
     return new_clip;
+}
+
+// Helper function to safely get a tensor or return NULL if it doesn't exist
+static struct ggml_tensor * get_tensor_if_exists(struct ggml_context * ctx, const std::string & name) {
+    struct ggml_tensor * cur = ggml_get_tensor(ctx, name.c_str());
+    return cur; // Returns NULL if tensor doesn't exist
 }
 
 void clip_add_load_image_size(struct clip_ctx * ctx_clip, struct clip_image_size * load_image_size) {
