@@ -749,10 +749,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
     if (ctx->has_minicpmv_projector) {
         int pos_w = image_size_width/patch_size;
         int pos_h = image_size_height/patch_size;
-        if (ctx->is_qwen2_5) {
-            pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2048, pos_w * pos_h, 1);
-        }
-        else if (ctx->minicpmv_version == 2) {
+        if (ctx->minicpmv_version == 2) {
             pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 4096, pos_w * pos_h, 1);
         }
         else if (ctx->minicpmv_version == 3) {
@@ -1143,12 +1140,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                 const int d_head = 128;
                 int n_head = hidden_size/d_head;
                 int num_query = 96;
-                if (ctx->is_qwen2_5) {
-                    hidden_size = 2048;
-                    n_head = hidden_size/d_head;
-                    num_query = 64;
-                }
-                else if (ctx->minicpmv_version == 2) {
+                if (ctx->minicpmv_version == 2) {
                     hidden_size = 4096;
                     n_head = hidden_size/d_head;
                     num_query = 96;
@@ -1224,7 +1216,20 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             GGML_ABORT("fatel error");
         }
     } else if (ctx->proj_type == PROJECTOR_TYPE_MERGER) {
-        embeddings = ggml_reshape_3d(ctx0, embeddings, hidden_size * 4, num_positions / 4, batch_size);
+        // Current problematic code:
+        // embeddings = ggml_reshape_3d(ctx0, embeddings, hidden_size * 4, num_positions / 4, batch_size);
+
+        // Replace with this fixed code:
+        // Calculate the dimensions correctly based on the actual tensor dimensions
+        int64_t n_elements = ggml_nelements(embeddings);
+        int64_t dim0 = hidden_size * 4;
+        int64_t dim1 = n_elements / (dim0 * batch_size);
+
+        // Ensure we have a valid number of elements for reshaping
+        GGML_ASSERT(dim0 * dim1 * batch_size == n_elements);
+
+        // Now do the reshape with calculated dimensions
+        embeddings = ggml_reshape_3d(ctx0, embeddings, dim0, dim1, batch_size);
 
         embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
         embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
@@ -3225,10 +3230,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         return ctx->vision_model.mm_3_b->ne[0];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {
-        if (ctx->is_qwen2_5) {
-            return 2048;
-        }
-        else if (ctx->minicpmv_version == 2) {
+        if (ctx->minicpmv_version == 2) {
             return 4096;
         }
         else if (ctx->minicpmv_version == 3) {
@@ -3242,11 +3244,6 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         return ctx->vision_model.mm_model_mlp_3_w->ne[1];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_MERGER) {
-        // For Qwen2.5, the output dimension is 2048 instead of 3584
-        if (ctx->is_qwen2_5) {
-            LOG_INF("%s: Qwen2.5 detected, using output dimension 2048\n", __func__);
-            return 2048;
-        }
         return ctx->vision_model.mm_1_b->ne[0];
     }
 

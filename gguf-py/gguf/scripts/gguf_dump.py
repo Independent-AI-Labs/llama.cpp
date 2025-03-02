@@ -57,7 +57,10 @@ def dump_metadata(reader: GGUFReader, args: argparse.Namespace) -> None:
                 if len(field.data) > 6:
                     content = content[:-1] + ', ...]'
                 log_message += ' = {0}'.format(content)
-        print(log_message)  # noqa: NP100
+        print(log_message.encode('ascii', 'replace').decode('ascii'))  # noqa: NP100
+        # The above line will replace non-ascii characters with a box character.
+        # If you want to see the actual non-ascii characters, use the line below instead:
+        # print(log_message)
     if args.no_tensors:
         return
     print(f'* Dumping {len(reader.tensors)} tensor(s)')  # noqa: NP100
