@@ -59,7 +59,7 @@
 #endif // defined(LLAVA_LOG_OFF)
 
 // Function to print debug messages only when debug flag is set
-#define DEBUG_PRINT_CLIP(params, ...) do { if ((params)->debug) { fprintf(stderr, "[DEBUG CLIP] "); fprintf(stderr, __VA_ARGS__); } } while (0)
+#define DEBUG_PRINT_CLIP(...) do { fprintf(stderr, "[DEBUG CLIP] "); fprintf(stderr, __VA_ARGS__); } while (0)
 
 //#define CLIP_DEBUG_FUNCTIONS
 
@@ -1229,6 +1229,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
 
 // read and create ggml_context containing the tensors and their data
 struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
+    DEBUG_PRINT_CLIP("Entering clip_model_load with file: %s, verbosity: %d\n", fname, verbosity);
     struct ggml_context * meta = NULL;
 
     struct gguf_init_params params = {
@@ -1236,10 +1237,13 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         /*.ctx      = */ &meta,
     };
 
+    DEBUG_PRINT_CLIP("Initializing GGUF context from file\n");
     struct gguf_context * ctx = gguf_init_from_file(fname, params);
     if (!ctx) {
+        DEBUG_PRINT_CLIP("Failed to load CLIP model from %s\n", fname);
         throw std::runtime_error(format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
     }
+    DEBUG_PRINT_CLIP("GGUF context successfully initialized\n");
 
     if (verbosity >= 1) {
         const int n_tensors = gguf_get_n_tensors(ctx);
@@ -1262,17 +1266,18 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         LOG_INF("\n");
     }
     const int n_tensors = gguf_get_n_tensors(ctx);
+    DEBUG_PRINT_CLIP("Model contains %d tensors\n", n_tensors);
 
     // kv
     const int n_kv = gguf_get_n_kv(ctx);
     LOG_INF("%s: loaded meta data with %d key-value pairs and %d tensors from %s\n",
         __func__, n_kv, n_tensors, fname);
+    DEBUG_PRINT_CLIP("Loaded metadata with %d key-value pairs\n", n_kv);
     {
         std::map<enum ggml_type, uint32_t> n_type;
 
         for (int i = 0; i < n_tensors; i++) {
             enum ggml_type type = gguf_get_tensor_type(ctx, i);
-
             n_type[type]++;
         }
 
@@ -1293,6 +1298,7 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             replace_all(value, "\n", "\\n");
 
             LOG_INF("%s: - kv %3d: %42s %-16s = %s\n", __func__, i, name, type_name.c_str(), value.c_str());
+            DEBUG_PRINT_CLIP("Processing KV pair %d: %s = %s\n", i, name, value.c_str());
         }
 
         // print type counts
@@ -1302,11 +1308,13 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             }
 
             LOG_INF("%s: - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second);
+            DEBUG_PRINT_CLIP("Tensor type count: %s = %d tensors\n", ggml_type_name(kv.first), kv.second);
         }
     }
 
     // data
     size_t model_size = 0;
+    DEBUG_PRINT_CLIP("Starting to calculate model size and inspect tensors\n");
     {
         for (int i = 0; i < n_tensors; ++i) {
             const char * name = gguf_get_tensor_name(ctx, i);
@@ -1319,95 +1327,134 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
                 LOG_INF("%s: tensor[%d]: n_dims = %d, name = %s, tensor_size=%zu, offset=%zu, shape:[%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 "], type = %s\n",
                        __func__, i, ggml_n_dims(cur), cur->name, tensor_size, offset, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], ggml_type_name(type));
             }
+            DEBUG_PRINT_CLIP("Tensor[%d]: name=%s, size=%zu bytes, type=%s\n",
+                i, name, tensor_size, ggml_type_name(type));
         }
     }
+    DEBUG_PRINT_CLIP("Total model size: %.2f MB\n", model_size / (1024.0 * 1024.0));
 
+    DEBUG_PRINT_CLIP("Creating new clip context\n");
     clip_ctx * new_clip = new clip_ctx{};
 
     // update projector type
     {
+        DEBUG_PRINT_CLIP("Determining projector type\n");
         int idx = gguf_find_key(ctx, KEY_PROJ_TYPE);
         if (idx != -1) {
             const std::string proj_type = gguf_get_val_str(ctx, idx);
             new_clip->proj_type = clip_projector_type_from_string(proj_type);
+            DEBUG_PRINT_CLIP("Found projector type: %s\n", proj_type.c_str());
         } else {
             new_clip->proj_type = PROJECTOR_TYPE_MLP;
+            DEBUG_PRINT_CLIP("No projector type specified, defaulting to MLP\n");
         }
 
         if (new_clip->proj_type == PROJECTOR_TYPE_MLP) {
             if (gguf_find_tensor(ctx, format(TN_LLAVA_PROJ, 3, "weight").c_str()) != -1) {
                 new_clip->proj_type = PROJECTOR_TYPE_MLP_NORM;
+                DEBUG_PRINT_CLIP("Detected MLP_NORM projector based on tensor presence\n");
             }
         }
     }
 
+    DEBUG_PRINT_CLIP("Initializing backend\n");
 #ifdef GGML_USE_CUDA
     new_clip->backend = ggml_backend_cuda_init(0);
+    DEBUG_PRINT_CLIP("Attempting to initialize CUDA backend\n");
+    if (new_clip->backend) {
+        DEBUG_PRINT_CLIP("Successfully initialized CUDA backend\n");
+    }
     LOG_INF("%s: CLIP using CUDA backend\n", __func__);
 #endif
 
 #ifdef GGML_USE_METAL
     new_clip->backend = ggml_backend_metal_init();
+    DEBUG_PRINT_CLIP("Attempting to initialize Metal backend\n");
+    if (new_clip->backend) {
+        DEBUG_PRINT_CLIP("Successfully initialized Metal backend\n");
+    }
     LOG_INF("%s: CLIP using Metal backend\n", __func__);
 #endif
 
 #ifdef GGML_USE_CANN
     new_clip->backend = ggml_backend_cann_init(0);
+    DEBUG_PRINT_CLIP("Attempting to initialize CANN backend\n");
+    if (new_clip->backend) {
+        DEBUG_PRINT_CLIP("Successfully initialized CANN backend\n");
+    }
     LOG_INF("%s: CLIP using CANN backend\n", __func__);
 #endif
 
 #ifdef GGML_USE_VULKAN
     new_clip->backend = ggml_backend_vk_init(0);
+    DEBUG_PRINT_CLIP("Attempting to initialize Vulkan backend\n");
+    if (new_clip->backend) {
+        DEBUG_PRINT_CLIP("Successfully initialized Vulkan backend\n");
+    }
     LOG_INF("%s: CLIP using Vulkan backend\n", __func__);
 #endif
 
 #ifdef GGML_USE_SYCL
     new_clip->backend = ggml_backend_sycl_init(0);
+    DEBUG_PRINT_CLIP("Attempting to initialize SYCL backend\n");
+    if (new_clip->backend) {
+        DEBUG_PRINT_CLIP("Successfully initialized SYCL backend\n");
+    }
     LOG_INF("%s: CLIP using SYCL backend\n", __func__);
 #endif
 
     if (!new_clip->backend) {
         new_clip->backend = ggml_backend_cpu_init();
+        DEBUG_PRINT_CLIP("Using CPU backend as fallback\n");
         LOG_INF("%s: CLIP using CPU backend\n", __func__);
     }
 
     // model size and capabilities
+    DEBUG_PRINT_CLIP("Reading model capabilities\n");
     {
         int idx = get_key_idx(ctx, KEY_HAS_TEXT_ENC);
         new_clip->has_text_encoder = gguf_get_val_bool(ctx, idx);
+        DEBUG_PRINT_CLIP("has_text_encoder: %d\n", new_clip->has_text_encoder);
 
         idx = get_key_idx(ctx, KEY_HAS_VIS_ENC);
         new_clip->has_vision_encoder = gguf_get_val_bool(ctx, idx);
+        DEBUG_PRINT_CLIP("has_vision_encoder: %d\n", new_clip->has_vision_encoder);
 
         idx = gguf_find_key(ctx, KEY_HAS_LLAVA_PROJ);
         if (idx != -1) {
             new_clip->has_llava_projector = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("has_llava_projector: %d\n", new_clip->has_llava_projector);
         }
 
         idx = gguf_find_key(ctx, KEY_HAS_MINICPMV_PROJ);
         if (idx != -1) {
             new_clip->has_minicpmv_projector = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("has_minicpmv_projector: %d\n", new_clip->has_minicpmv_projector);
         }
 
         idx = gguf_find_key(ctx, KEY_MINICPMV_VERSION);
         if (idx != -1) {
             new_clip->minicpmv_version = gguf_get_val_i32(ctx, idx);
+            DEBUG_PRINT_CLIP("minicpmv_version: %d\n", new_clip->minicpmv_version);
         }
 
         idx = gguf_find_key(ctx, KEY_HAS_GLM_PROJ);
         if (idx != -1) {
             new_clip->has_glm_projector = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("has_glm_projector: %d\n", new_clip->has_glm_projector);
         }
 
         idx = gguf_find_key(ctx, KEY_HAS_QWEN2VL_MERGER);
         if (idx != -1) {
             new_clip->has_qwen2vl_merger = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("has_qwen2vl_merger: %d\n", new_clip->has_qwen2vl_merger);
         }
         // GGML_ASSERT(new_clip->has_llava_projector); // see monatis/clip.cpp for image and/or text encoding for semantic search
 
         idx = gguf_find_key(ctx, KEY_IS_QWEN2_5);
         if (idx != -1) {
             new_clip->is_qwen2_5 = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("is_qwen2_5: %d\n", new_clip->is_qwen2_5);
         }
 
         GGML_ASSERT(new_clip->has_vision_encoder);
@@ -1415,12 +1462,15 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
 
         idx = get_key_idx(ctx, KEY_USE_GELU);
         new_clip->use_gelu = gguf_get_val_bool(ctx, idx);
+        DEBUG_PRINT_CLIP("use_gelu: %d\n", new_clip->use_gelu);
 
         try {
             idx = get_key_idx(ctx, KEY_USE_SILU);
             new_clip->use_silu = gguf_get_val_bool(ctx, idx);
+            DEBUG_PRINT_CLIP("use_silu: %d\n", new_clip->use_silu);
         } catch (std::runtime_error & /*e*/) {
             new_clip->use_silu = false;
+            DEBUG_PRINT_CLIP("use_silu not found, defaulting to false\n");
         }
 
         if (verbosity >= 1) {
@@ -1437,6 +1487,7 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
     LOG_INF("%s: params backend buffer size = % 6.2f MB (%i tensors)\n", __func__, model_size / (1024.0 * 1024.0), n_tensors);
 
     // load tensors
+    DEBUG_PRINT_CLIP("Beginning tensor loading process\n");
     {
         std::vector<uint8_t> read_buf;
         struct ggml_init_params params = {
@@ -1445,16 +1496,20 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             /*.no_alloc =*/ true,
         };
 
+        DEBUG_PRINT_CLIP("Initializing data context with overhead for %d tensors\n", n_tensors + 1);
         new_clip->ctx_data = ggml_init(params);
         if (!new_clip->ctx_data) {
+            DEBUG_PRINT_CLIP("ggml_init() failed for ctx_data\n");
             LOG_ERR("%s: ggml_init() failed\n", __func__);
             clip_free(new_clip);
             gguf_free(ctx);
             return nullptr;
         }
 
+        DEBUG_PRINT_CLIP("Opening model file for reading tensors: %s\n", fname);
         auto fin = std::ifstream(fname, std::ios::binary);
         if (!fin) {
+            DEBUG_PRINT_CLIP("Failed to open model file for loading tensors\n");
             LOG_ERR("cannot open model file for loading tensors\n");
             clip_free(new_clip);
             gguf_free(ctx);
@@ -1462,14 +1517,17 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         }
 
         // add tensors to context
+        DEBUG_PRINT_CLIP("Adding tensors to context\n");
         for (int i = 0; i < n_tensors; ++i) {
             const char * name = gguf_get_tensor_name(ctx, i);
             struct ggml_tensor * t = ggml_get_tensor(meta, name);
             struct ggml_tensor * cur = ggml_dup_tensor(new_clip->ctx_data, t);
             ggml_set_name(cur, name);
+            DEBUG_PRINT_CLIP("Added tensor[%d]: %s\n", i, name);
         }
 
         // alloc memory and offload data
+        DEBUG_PRINT_CLIP("Allocating backend memory for tensors\n");
         new_clip->params_buffer = ggml_backend_alloc_ctx_tensors(new_clip->ctx_data, new_clip->backend);
         for (int i = 0; i < n_tensors; ++i) {
             const char * name = gguf_get_tensor_name(ctx, i);
@@ -1477,26 +1535,32 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             const size_t offset = gguf_get_data_offset(ctx) + gguf_get_tensor_offset(ctx, i);
             fin.seekg(offset, std::ios::beg);
             if (!fin) {
+                DEBUG_PRINT_CLIP("Failed to seek to offset %zu for tensor %s\n", offset, name);
                 LOG_ERR("%s: failed to seek for tensor %s\n", __func__, name);
                 clip_free(new_clip);
                 gguf_free(ctx);
                 return nullptr;
             }
             int num_bytes = ggml_nbytes(cur);
+            DEBUG_PRINT_CLIP("Loading tensor[%d]: %s (%d bytes)\n", i, name, num_bytes);
             if (ggml_backend_buffer_is_host(new_clip->params_buffer)) {
                 // for the CPU and Metal backend, we can read directly into the tensor
                 fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                DEBUG_PRINT_CLIP("Direct read into host memory for tensor %s\n", name);
             } else {
                 // read into a temporary buffer first, then copy to device memory
                 read_buf.resize(num_bytes);
                 fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
                 ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                DEBUG_PRINT_CLIP("Used temporary buffer for device memory tensor %s\n", name);
             }
         }
         fin.close();
+        DEBUG_PRINT_CLIP("Finished loading all tensors\n");
     }
 
     // vision model
+    DEBUG_PRINT_CLIP("Setting up vision model\n");
     if (new_clip->has_vision_encoder) {
         // load vision model
         auto & vision_model = new_clip->vision_model;
@@ -1510,14 +1574,21 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         hparams.projection_dim = get_u32(ctx, format(KEY_PROJ_DIM, "vision"));
         hparams.eps            = get_f32(ctx, format(KEY_LAYER_NORM_EPS, "vision"));
 
+        DEBUG_PRINT_CLIP("Vision model params: hidden_size=%d, n_head=%d, n_layer=%d, image_size=%d, patch_size=%d\n",
+            hparams.hidden_size, hparams.n_head, hparams.n_layer, hparams.image_size, hparams.patch_size);
+
         try {
             int idx = get_key_idx(ctx, KEY_IMAGE_GRID_PINPOINTS);
             int n = gguf_get_arr_n(ctx, idx);
             const int32_t * pinpoints = (const int32_t *)gguf_get_arr_data(ctx, idx);
+            DEBUG_PRINT_CLIP("Loading %d image grid pinpoints\n", n);
             for (int i = 0; i < n; ++i) {
                 hparams.image_grid_pinpoints.push_back(pinpoints[i]);
+                DEBUG_PRINT_CLIP("Pinpoint[%d] = %d\n", i, pinpoints[i]);
             }
-        } catch (std::runtime_error & /*e*/) { }
+        } catch (std::runtime_error & /*e*/) {
+            DEBUG_PRINT_CLIP("No image grid pinpoints found\n");
+        }
 
         // Load the vision feature layer indices if they are explicitly provided;
         // if multiple vision feature layers are present, the values will be concatenated
@@ -1529,23 +1600,31 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             int n = gguf_get_arr_n(ctx, idx);
 
             const int32_t * vision_feature_layer = (const int32_t *)gguf_get_arr_data(ctx, idx);
+            DEBUG_PRINT_CLIP("Loading %d vision feature layers\n", n);
 
             for (int i = 0; i < n; ++i) {
                 hparams.vision_feature_layer.insert(vision_feature_layer[i]);
+                DEBUG_PRINT_CLIP("Feature layer[%d] = %d\n", i, vision_feature_layer[i]);
             }
-        } catch (std::runtime_error & /*e*/) { }
+        } catch (std::runtime_error & /*e*/) {
+            DEBUG_PRINT_CLIP("No vision feature layers specified\n");
+        }
 
         try {
             int idx = get_key_idx(ctx, KEY_MM_PATCH_MERGE_TYPE);
             strcpy(hparams.mm_patch_merge_type, gguf_get_val_str(ctx, idx));
+            DEBUG_PRINT_CLIP("MM patch merge type: %s\n", hparams.mm_patch_merge_type);
         } catch (std::runtime_error & /*e*/) {
             strcpy(hparams.mm_patch_merge_type, "flat");
+            DEBUG_PRINT_CLIP("No MM patch merge type specified, defaulting to 'flat'\n");
         }
 
         try {
             hparams.image_crop_resolution = get_u32(ctx, KEY_IMAGE_CROP_RESOLUTION); // llava-1.6
+            DEBUG_PRINT_CLIP("Image crop resolution: %d\n", hparams.image_crop_resolution);
         } catch(const std::exception& /*e*/) {
             hparams.image_crop_resolution = hparams.image_size;
+            DEBUG_PRINT_CLIP("No image crop resolution specified, defaulting to image_size (%d)\n", hparams.image_size);
         }
 
         int idx_mean = get_key_idx(ctx, KEY_IMAGE_MEAN);
@@ -1554,13 +1633,16 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         const float * mean_data = (const float *)gguf_get_arr_data(ctx, idx_mean);
         const float * std_data  = (const float *)gguf_get_arr_data(ctx, idx_std);
 
+        DEBUG_PRINT_CLIP("Loading image normalization parameters\n");
         for (int i = 0; i < 3; ++i) {
             new_clip->image_mean[i] = mean_data[i];
             new_clip->image_std[i]  = std_data[i];
+            DEBUG_PRINT_CLIP("Channel %d: mean=%f, std=%f\n", i, new_clip->image_mean[i], new_clip->image_std[i]);
         }
 
         // Calculate the deepest feature layer based on hparams and projector type
         new_clip->max_feature_layer = get_deepest_feature_layer(new_clip);
+        DEBUG_PRINT_CLIP("Max feature layer calculated as: %d\n", new_clip->max_feature_layer);
 
         if (verbosity >= 2) {
             LOG_INF("\n%s: vision model hparams\n", __func__);
@@ -1588,78 +1670,113 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
 
         }
 
+        DEBUG_PRINT_CLIP("Loading class embedding\n");
         try {
             vision_model.class_embedding  = get_tensor(new_clip->ctx_data, TN_CLASS_EMBD);
             new_clip->has_class_embedding = true;
+            DEBUG_PRINT_CLIP("Found class embedding tensor\n");
         } catch (const std::exception& /*e*/) {
             new_clip->has_class_embedding = false;
+            DEBUG_PRINT_CLIP("No class embedding tensor found\n");
         }
 
+        DEBUG_PRINT_CLIP("Loading pre-normalization layers\n");
         try {
             vision_model.pre_ln_w  = get_tensor(new_clip->ctx_data, format(TN_LN_PRE, "v", "weight"));
             vision_model.pre_ln_b  = get_tensor(new_clip->ctx_data, format(TN_LN_PRE, "v", "bias"));
             new_clip->has_pre_norm = true;
+            DEBUG_PRINT_CLIP("Found pre-normalization layers\n");
         } catch (std::exception & /*e*/) {
             new_clip->has_pre_norm = false;
+            DEBUG_PRINT_CLIP("No pre-normalization layers found\n");
         }
 
+        DEBUG_PRINT_CLIP("Loading post-normalization layers\n");
         try {
             vision_model.post_ln_w  = get_tensor(new_clip->ctx_data, format(TN_LN_POST, "v", "weight"));
             vision_model.post_ln_b  = get_tensor(new_clip->ctx_data, format(TN_LN_POST, "v", "bias"));
             new_clip->has_post_norm = true;
+            DEBUG_PRINT_CLIP("Found post-normalization layers\n");
         } catch (std::exception & /*e*/) {
             new_clip->has_post_norm = false;
+            DEBUG_PRINT_CLIP("No post-normalization layers found\n");
         }
 
+        DEBUG_PRINT_CLIP("Loading patch bias\n");
         try {
             vision_model.patch_bias = get_tensor(new_clip->ctx_data, TN_PATCH_BIAS);
             new_clip->has_patch_bias = true;
+            DEBUG_PRINT_CLIP("Found patch bias tensor\n");
         } catch (std::exception & /*e*/) {
             new_clip->has_patch_bias = false;
+            DEBUG_PRINT_CLIP("No patch bias tensor found\n");
         }
 
+        DEBUG_PRINT_CLIP("Loading patch and position embeddings\n");
         try {
             vision_model.patch_embeddings_0    = get_tensor(new_clip->ctx_data, TN_PATCH_EMBD);
             vision_model.position_embeddings = get_tensor(new_clip->ctx_data, format(TN_POS_EMBD, "v"));
+            DEBUG_PRINT_CLIP("Successfully loaded patch and position embeddings\n");
         } catch(const std::exception& /*e*/) {
+            DEBUG_PRINT_CLIP("Failed to load vision model embeddings tensors\n");
             LOG_ERR("%s: failed to load vision model tensors\n", __func__);
         }
         try {
             vision_model.patch_embeddings_1    = get_tensor(new_clip->ctx_data, TN_PATCH_EMBD_1);
+            DEBUG_PRINT_CLIP("Found secondary patch embeddings\n");
         } catch(const std::exception& /*e*/) {
             new_clip->has_qwen2vl_merger = false;
+            DEBUG_PRINT_CLIP("No secondary patch embeddings found, setting has_qwen2vl_merger to false\n");
         }
 
         // LLaVA projection
+        DEBUG_PRINT_CLIP("Loading projector based on type: %d\n", new_clip->proj_type);
         if (new_clip->proj_type == PROJECTOR_TYPE_MLP || new_clip->proj_type == PROJECTOR_TYPE_MLP_NORM) {
+            DEBUG_PRINT_CLIP("Loading MLP or MLP_NORM projector tensors\n");
             vision_model.mm_0_w              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "weight"));
             vision_model.mm_0_b              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "bias"));
+            DEBUG_PRINT_CLIP("Loaded mm_0 tensors\n");
             try {
                 // Yi-type llava
                 vision_model.mm_1_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 1, "weight"));
                 vision_model.mm_1_b = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 1, "bias"));
-            } catch (std::runtime_error & /*e*/) { }
+                DEBUG_PRINT_CLIP("Loaded mm_1 tensors (Yi-type)\n");
+            } catch (std::runtime_error & /*e*/) {
+                DEBUG_PRINT_CLIP("No mm_1 tensors found\n");
+            }
             try {
                 // missing in Yi-type llava
                 vision_model.mm_2_w              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 2, "weight"));
                 vision_model.mm_2_b              = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 2, "bias"));
-            } catch (std::runtime_error & /*e*/) { }
+                DEBUG_PRINT_CLIP("Loaded mm_2 tensors\n");
+            } catch (std::runtime_error & /*e*/) {
+                DEBUG_PRINT_CLIP("No mm_2 tensors found\n");
+            }
             try {
                 // Yi-type llava
                 vision_model.mm_3_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 3, "weight"));
                 vision_model.mm_3_b = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 3, "bias"));
-            } catch (std::runtime_error & /*e*/) { }
+                DEBUG_PRINT_CLIP("Loaded mm_3 tensors (Yi-type)\n");
+            } catch (std::runtime_error & /*e*/) {
+                DEBUG_PRINT_CLIP("No mm_3 tensors found\n");
+            }
             try {
                 // Yi-type llava
                 vision_model.mm_4_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 4, "weight"));
                 vision_model.mm_4_b = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 4, "bias"));
-            } catch (std::runtime_error & /*e*/) { }
+                DEBUG_PRINT_CLIP("Loaded mm_4 tensors (Yi-type)\n");
+            } catch (std::runtime_error & /*e*/) {
+                DEBUG_PRINT_CLIP("No mm_4 tensors found\n");
+            }
             try {
                 vision_model.image_newline = get_tensor(new_clip->ctx_data, TN_IMAGE_NEWLINE);
-                // LOG_INF("%s: image_newline tensor (llava-1.6) found\n", __func__);
-            } catch (std::runtime_error & /*e*/) { }
+                DEBUG_PRINT_CLIP("Found image_newline tensor (llava-1.6)\n");
+            } catch (std::runtime_error & /*e*/) {
+                DEBUG_PRINT_CLIP("No image_newline tensor found\n");
+            }
         } else if (new_clip->proj_type == PROJECTOR_TYPE_LDP) {
             // MobileVLM projection
+            DEBUG_PRINT_CLIP("Loading LDP projector tensors (MobileVLM)\n");
             vision_model.mm_model_mlp_1_w               = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 1, "weight"));
             vision_model.mm_model_mlp_1_b               = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 1, "bias"));
             vision_model.mm_model_mlp_3_w               = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 3, "weight"));
@@ -1684,18 +1801,22 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             vision_model.mm_model_block_2_block_2_0_w   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "0.weight"));
             vision_model.mm_model_block_2_block_2_1_w   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.weight"));
             vision_model.mm_model_block_2_block_2_1_b   = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_BLOCK, 2, 2, "1.bias"));
+            DEBUG_PRINT_CLIP("Successfully loaded all LDP projector tensors\n");
         }
         else if (new_clip->proj_type == PROJECTOR_TYPE_LDPV2)
         {
             // MobilVLM_V2 projection
+            DEBUG_PRINT_CLIP("Loading LDPV2 projector tensors (MobileVLM V2)\n");
             vision_model.mm_model_mlp_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 0, "weight"));
             vision_model.mm_model_mlp_0_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 0, "bias"));
             vision_model.mm_model_mlp_2_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 2, "weight"));
             vision_model.mm_model_mlp_2_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 2, "bias"));
             vision_model.mm_model_peg_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "weight"));
             vision_model.mm_model_peg_0_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "bias"));
+            DEBUG_PRINT_CLIP("Successfully loaded all LDPV2 projector tensors\n");
         }
         else if (new_clip->proj_type == PROJECTOR_TYPE_RESAMPLER) {
+            DEBUG_PRINT_CLIP("Loading RESAMPLER projector tensors\n");
             // vision_model.mm_model_pos_embed = get_tensor(new_clip->ctx_data, TN_MINICPMV_POS_EMBD);
             vision_model.mm_model_pos_embed_k = get_tensor(new_clip->ctx_data, TN_MINICPMV_POS_EMBD_K);
             vision_model.mm_model_query = get_tensor(new_clip->ctx_data, TN_MINICPMV_QUERY);
@@ -1715,8 +1836,10 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             vision_model.mm_model_ln_kv_b = get_tensor(new_clip->ctx_data, format(TN_MINICPMV_LN, "kv", "bias"));
             vision_model.mm_model_ln_post_w = get_tensor(new_clip->ctx_data, format(TN_MINICPMV_LN, "post", "weight"));
             vision_model.mm_model_ln_post_b = get_tensor(new_clip->ctx_data, format(TN_MINICPMV_LN, "post", "bias"));
+            DEBUG_PRINT_CLIP("Successfully loaded all RESAMPLER projector tensors\n");
         }
         else if (new_clip->proj_type == PROJECTOR_TYPE_GLM_EDGE) {
+            DEBUG_PRINT_CLIP("Loading GLM_EDGE projector tensors\n");
             vision_model.mm_model_adapter_conv_w = get_tensor(new_clip->ctx_data, format(TN_GLM_ADAPER_CONV, "weight"));
             vision_model.mm_model_adapter_conv_b = get_tensor(new_clip->ctx_data, format(TN_GLM_ADAPER_CONV, "bias"));
             vision_model.mm_model_mlp_0_w = get_tensor(new_clip->ctx_data, format(TN_GLM_ADAPTER_LINEAR,"weight"));
@@ -1727,21 +1850,27 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             vision_model.mm_model_mlp_3_w =  get_tensor(new_clip->ctx_data, format(TN_GLM_ADAPTER_D_4H_2_H,"weight"));
             vision_model.boi_w = get_tensor(new_clip->ctx_data, TN_GLM_BOI_W);
             vision_model.eoi_w = get_tensor(new_clip->ctx_data, TN_GLM_EOI_W);
+            DEBUG_PRINT_CLIP("Successfully loaded all GLM_EDGE projector tensors\n");
         }
         else if (new_clip->proj_type == PROJECTOR_TYPE_MERGER) {
+            DEBUG_PRINT_CLIP("Loading MERGER projector tensors\n");
             vision_model.mm_0_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "weight"));
             vision_model.mm_0_b = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 0, "bias"));
             vision_model.mm_1_w = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 2, "weight"));
             vision_model.mm_1_b = get_tensor(new_clip->ctx_data, format(TN_LLAVA_PROJ, 2, "bias"));
+            DEBUG_PRINT_CLIP("Successfully loaded all MERGER projector tensors\n");
         }
         else {
             std::string proj_type = PROJECTOR_TYPE_NAMES[new_clip->proj_type];
+            DEBUG_PRINT_CLIP("Unsupported projector type: %s\n", proj_type.c_str());
             throw std::runtime_error(format("%s: don't support projector with: %s currently\n", __func__, proj_type.c_str()));
         }
 
+        DEBUG_PRINT_CLIP("Resizing vision model layers to %d layers\n", hparams.n_layer);
         vision_model.layers.resize(hparams.n_layer);
 
         for (int il = 0; il < hparams.n_layer; ++il) {
+            DEBUG_PRINT_CLIP("Loading vision model layer %d\n", il);
             auto & layer = vision_model.layers[il];
             layer.k_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_K,      "v", il, "weight"));
             layer.q_w    = get_tensor(new_clip->ctx_data, format(TN_ATTN_Q,      "v", il, "weight"));
@@ -1760,13 +1889,17 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             layer.ff_i_b = get_tensor(new_clip->ctx_data, format(TN_FFN_DOWN,    "v", il, "bias"));
             layer.ff_o_b = get_tensor(new_clip->ctx_data, format(TN_FFN_UP,      "v", il, "bias"));
         }
+        DEBUG_PRINT_CLIP("Successfully loaded all vision model layers\n");
     }
 
+    DEBUG_PRINT_CLIP("Freeing metadata context\n");
     ggml_free(meta);
 
     new_clip->ctx_gguf = ctx;
+    DEBUG_PRINT_CLIP("Stored GGUF context in clip\n");
 
     // measure mem requirement and allocate
+    DEBUG_PRINT_CLIP("Measuring memory requirements and allocating compute buffer\n");
     {
         new_clip->buf_compute_meta.resize(GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + ggml_graph_overhead());
         new_clip->compute_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(new_clip->backend));
@@ -1777,8 +1910,10 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
         ggml_gallocr_reserve(new_clip->compute_alloc, gf);
         size_t compute_memory_buffer_size = ggml_gallocr_get_buffer_size(new_clip->compute_alloc, 0);
         LOG_INF("%s: compute allocated memory: %.2f MB\n", __func__, compute_memory_buffer_size /1024.0/1024.0);
+        DEBUG_PRINT_CLIP("Compute memory buffer size: %.2f MB\n", compute_memory_buffer_size /1024.0/1024.0);
     }
 
+    DEBUG_PRINT_CLIP("Successfully loaded CLIP model from %s\n", fname);
     return new_clip;
 }
 

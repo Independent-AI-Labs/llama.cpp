@@ -106,6 +106,10 @@ CLIP_API int get_deepest_feature_layer(const struct clip_ctx * ctx);
 CLIP_API bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec);
 
 
+struct params {
+    bool debug = true;
+};
+
 #ifdef __cplusplus
 }
 #endif

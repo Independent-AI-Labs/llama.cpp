@@ -498,149 +498,149 @@ static void llava_free(struct llava_context * ctx_llava) {
 }
 
 #ifndef NDEBUG
-
-static void debug_test_mrope_2d() {
-    fprintf(stderr, "[DEBUG] debug_test_mrope_2d: Starting MROPE 2D test\n");
-
-    // 1. Initialize backend
-    ggml_backend_t backend = NULL;
-    std::string backend_name = "";
-#ifdef GGML_USE_CUDA
-    fprintf(stderr, "[DEBUG] Using CUDA backend\n");
-    backend = ggml_backend_cuda_init(0); // init device 0
-    backend_name = "cuda";
-    if (!backend) {
-        fprintf(stderr, "[DEBUG] ggml_backend_cuda_init() failed\n");
-    }
-#endif
-    // if there aren't GPU Backends fallback to CPU backend
-    if (!backend) {
-        backend = ggml_backend_cpu_init();
-        backend_name = "cpu";
-        fprintf(stderr, "[DEBUG] Using CPU backend\n");
-    }
-
-    // Calculate the size needed to allocate
-    size_t ctx_size = 0;
-    ctx_size += 2 * ggml_tensor_overhead(); // tensors
-    // no need to allocate anything else!
-
-    // 2. Allocate `ggml_context` to store tensor data
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ctx_size,
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_backend_alloc_ctx_tensors()
-    };
-    struct ggml_context * ctx = ggml_init(params);
-
-    struct ggml_tensor * inp_raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 12, 30);
-    ggml_set_name(inp_raw, "inp_raw");
-    ggml_set_input(inp_raw);
-
-    struct ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 30 * 4);
-    ggml_set_name(pos, "pos");
-    ggml_set_input(pos);
-
-    fprintf(stderr, "[DEBUG] Created tensors inp_raw: [%d, %d, %d], pos: [%d]\n",
-            (int)inp_raw->ne[0], (int)inp_raw->ne[1], (int)inp_raw->ne[2], (int)pos->ne[0]);
-
-    std::vector<float> dummy_q;
-    dummy_q.resize(128 * 12 * 30);
-    std::fill(dummy_q.begin(), dummy_q.end(), 0.1);
-    // memcpy(inp_raw->data, dummy_q.data(), 128 * 12 * 30 * ggml_element_size(inp_raw));
-
-    std::vector<int> pos_id;
-    pos_id.resize(30 * 4);
-    for (int i = 0; i < 30; i ++) {
-        pos_id[i] = i;
-        pos_id[i + 30] = i + 10;
-        pos_id[i + 60] = i + 20;
-        pos_id[i + 90] = i + 30;
-    }
-    int sections[4] = {32, 32, 0, 0};
-
-    fprintf(stderr, "[DEBUG] First 5 position IDs: [%d, %d, %d, %d, %d]\n",
-            pos_id[0], pos_id[1], pos_id[2], pos_id[3], pos_id[4]);
-
-    // 4. Allocate a `ggml_backend_buffer` to store all tensors
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    fprintf(stderr, "[DEBUG] Allocated backend buffer for tensors\n");
-
-    // 5. Copy tensor data from main memory (RAM) to backend buffer
-    ggml_backend_tensor_set(inp_raw, dummy_q.data(), 0, ggml_nbytes(inp_raw));
-    ggml_backend_tensor_set(pos, pos_id.data(), 0, ggml_nbytes(pos));
-    fprintf(stderr, "[DEBUG] Copied tensor data to backend\n");
-
-    // 6. Create a `ggml_cgraph` for mul_mat operation
-    struct ggml_cgraph * gf = NULL;
-    struct ggml_context * ctx_cgraph = NULL;
-
-    // create a temporally context to build the graph
-    struct ggml_init_params params0 = {
-        /*.mem_size   =*/ ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_gallocr_alloc_graph()
-    };
-    ctx_cgraph = ggml_init(params0);
-    gf = ggml_new_graph(ctx_cgraph);
-    fprintf(stderr, "[DEBUG] Created computational graph\n");
-
-    struct ggml_tensor * result0 = ggml_rope_multi(
-        ctx_cgraph, inp_raw, pos, nullptr,
-        128/2, sections, LLAMA_ROPE_TYPE_VISION, 32768, 1000000, 1,
-        0, 1, 32, 1);
-    fprintf(stderr, "[DEBUG] Added ggml_rope_multi operation to graph\n");
-
-    // Add "result" tensor and all of its dependencies to the cgraph
-    ggml_build_forward_expand(gf, result0);
-    fprintf(stderr, "[DEBUG] Built forward graph with %d nodes\n", gf->n_nodes);
-
-    // 7. Create a `ggml_gallocr` for cgraph computation
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, gf);
-    fprintf(stderr, "[DEBUG] Allocated memory for computation\n");
-
-    // 9. Run the computation
-    int n_threads = 1; // Optional: number of threads to perform some operations with multi-threading
-    if (ggml_backend_is_cpu(backend)) {
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-    }
-    fprintf(stderr, "[DEBUG] Computing graph with %d threads\n", n_threads);
-    ggml_backend_graph_compute(backend, gf);
-    fprintf(stderr, "[DEBUG] Computation complete\n");
-
-    // 10. Retrieve results (output tensors)
-    // in this example, output tensor is always the last tensor in the graph
-    struct ggml_tensor * result = result0;
-    // struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    float * result_data = (float *)malloc(ggml_nbytes(result));
-    // because the tensor data is stored in device buffer, we need to copy it back to RAM
-    ggml_backend_tensor_get(result, result_data, 0, ggml_nbytes(result));
-    const std::string bin_file = "mrope_2d_" + backend_name +".bin";
-    std::ofstream outFile(bin_file, std::ios::binary);
-
-    fprintf(stderr, "[DEBUG] Result tensor shape: [%d, %d, %d, %d]\n",
-            (int)result->ne[0], (int)result->ne[1], (int)result->ne[2], (int)result->ne[3]);
-
-    if (outFile.is_open()) {
-        outFile.write(reinterpret_cast<const char*>(result_data), ggml_nbytes(result));
-        outFile.close();
-        std::cout << "Data successfully written to " + bin_file << std::endl;
-        fprintf(stderr, "[DEBUG] Saved result to %s (%zu bytes)\n", bin_file.c_str(), ggml_nbytes(result));
-    } else {
-        std::cerr << "Error opening file!" << std::endl;
-        fprintf(stderr, "[DEBUG] Failed to save result to %s\n", bin_file.c_str());
-    }
-
-    free(result_data);
-    // 11. Free memory and exit
-    ggml_free(ctx_cgraph);
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
-    fprintf(stderr, "[DEBUG] Cleaned up resources\n");
-}
+//
+//static void debug_test_mrope_2d() {
+//    fprintf(stderr, "[DEBUG] debug_test_mrope_2d: Starting MROPE 2D test\n");
+//
+//    // 1. Initialize backend
+//    ggml_backend_t backend = NULL;
+//    std::string backend_name = "";
+//#ifdef GGML_USE_CUDA
+//    fprintf(stderr, "[DEBUG] Using CUDA backend\n");
+//    backend = ggml_backend_cuda_init(0); // init device 0
+//    backend_name = "cuda";
+//    if (!backend) {
+//        fprintf(stderr, "[DEBUG] ggml_backend_cuda_init() failed\n");
+//    }
+//#endif
+//    // if there aren't GPU Backends fallback to CPU backend
+//    if (!backend) {
+//        backend = ggml_backend_cpu_init();
+//        backend_name = "cpu";
+//        fprintf(stderr, "[DEBUG] Using CPU backend\n");
+//    }
+//
+//    // Calculate the size needed to allocate
+//    size_t ctx_size = 0;
+//    ctx_size += 2 * ggml_tensor_overhead(); // tensors
+//    // no need to allocate anything else!
+//
+//    // 2. Allocate `ggml_context` to store tensor data
+//    struct ggml_init_params params = {
+//        /*.mem_size   =*/ ctx_size,
+//        /*.mem_buffer =*/ NULL,
+//        /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_backend_alloc_ctx_tensors()
+//    };
+//    struct ggml_context * ctx = ggml_init(params);
+//
+//    struct ggml_tensor * inp_raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 12, 30);
+//    ggml_set_name(inp_raw, "inp_raw");
+//    ggml_set_input(inp_raw);
+//
+//    struct ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 30 * 4);
+//    ggml_set_name(pos, "pos");
+//    ggml_set_input(pos);
+//
+//    fprintf(stderr, "[DEBUG] Created tensors inp_raw: [%d, %d, %d], pos: [%d]\n",
+//            (int)inp_raw->ne[0], (int)inp_raw->ne[1], (int)inp_raw->ne[2], (int)pos->ne[0]);
+//
+//    std::vector<float> dummy_q;
+//    dummy_q.resize(128 * 12 * 30);
+//    std::fill(dummy_q.begin(), dummy_q.end(), 0.1);
+//    // memcpy(inp_raw->data, dummy_q.data(), 128 * 12 * 30 * ggml_element_size(inp_raw));
+//
+//    std::vector<int> pos_id;
+//    pos_id.resize(30 * 4);
+//    for (int i = 0; i < 30; i ++) {
+//        pos_id[i] = i;
+//        pos_id[i + 30] = i + 10;
+//        pos_id[i + 60] = i + 20;
+//        pos_id[i + 90] = i + 30;
+//    }
+//    int sections[4] = {32, 32, 0, 0};
+//
+//    fprintf(stderr, "[DEBUG] First 5 position IDs: [%d, %d, %d, %d, %d]\n",
+//            pos_id[0], pos_id[1], pos_id[2], pos_id[3], pos_id[4]);
+//
+//    // 4. Allocate a `ggml_backend_buffer` to store all tensors
+//    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+//    fprintf(stderr, "[DEBUG] Allocated backend buffer for tensors\n");
+//
+//    // 5. Copy tensor data from main memory (RAM) to backend buffer
+//    ggml_backend_tensor_set(inp_raw, dummy_q.data(), 0, ggml_nbytes(inp_raw));
+//    ggml_backend_tensor_set(pos, pos_id.data(), 0, ggml_nbytes(pos));
+//    fprintf(stderr, "[DEBUG] Copied tensor data to backend\n");
+//
+//    // 6. Create a `ggml_cgraph` for mul_mat operation
+//    struct ggml_cgraph * gf = NULL;
+//    struct ggml_context * ctx_cgraph = NULL;
+//
+//    // create a temporally context to build the graph
+//    struct ggml_init_params params0 = {
+//        /*.mem_size   =*/ ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead(),
+//        /*.mem_buffer =*/ NULL,
+//        /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_gallocr_alloc_graph()
+//    };
+//    ctx_cgraph = ggml_init(params0);
+//    gf = ggml_new_graph(ctx_cgraph);
+//    fprintf(stderr, "[DEBUG] Created computational graph\n");
+//
+//    struct ggml_tensor * result0 = ggml_rope_multi(
+//        ctx_cgraph, inp_raw, pos, nullptr,
+//        128/2, sections, LLAMA_ROPE_TYPE_VISION, 32768, 1000000, 1,
+//        0, 1, 32, 1);
+//    fprintf(stderr, "[DEBUG] Added ggml_rope_multi operation to graph\n");
+//
+//    // Add "result" tensor and all of its dependencies to the cgraph
+//    ggml_build_forward_expand(gf, result0);
+//    fprintf(stderr, "[DEBUG] Built forward graph with %d nodes\n", gf->n_nodes);
+//
+//    // 7. Create a `ggml_gallocr` for cgraph computation
+//    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+//    ggml_gallocr_alloc_graph(allocr, gf);
+//    fprintf(stderr, "[DEBUG] Allocated memory for computation\n");
+//
+//    // 9. Run the computation
+//    int n_threads = 1; // Optional: number of threads to perform some operations with multi-threading
+//    if (ggml_backend_is_cpu(backend)) {
+//        ggml_backend_cpu_set_n_threads(backend, n_threads);
+//    }
+//    fprintf(stderr, "[DEBUG] Computing graph with %d threads\n", n_threads);
+//    ggml_backend_graph_compute(backend, gf);
+//    fprintf(stderr, "[DEBUG] Computation complete\n");
+//
+//    // 10. Retrieve results (output tensors)
+//    // in this example, output tensor is always the last tensor in the graph
+//    struct ggml_tensor * result = result0;
+//    // struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
+//    float * result_data = (float *)malloc(ggml_nbytes(result));
+//    // because the tensor data is stored in device buffer, we need to copy it back to RAM
+//    ggml_backend_tensor_get(result, result_data, 0, ggml_nbytes(result));
+//    const std::string bin_file = "mrope_2d_" + backend_name +".bin";
+//    std::ofstream outFile(bin_file, std::ios::binary);
+//
+//    fprintf(stderr, "[DEBUG] Result tensor shape: [%d, %d, %d, %d]\n",
+//            (int)result->ne[0], (int)result->ne[1], (int)result->ne[2], (int)result->ne[3]);
+//
+//    if (outFile.is_open()) {
+//        outFile.write(reinterpret_cast<const char*>(result_data), ggml_nbytes(result));
+//        outFile.close();
+//        std::cout << "Data successfully written to " + bin_file << std::endl;
+//        fprintf(stderr, "[DEBUG] Saved result to %s (%zu bytes)\n", bin_file.c_str(), ggml_nbytes(result));
+//    } else {
+//        std::cerr << "Error opening file!" << std::endl;
+//        fprintf(stderr, "[DEBUG] Failed to save result to %s\n", bin_file.c_str());
+//    }
+//
+//    free(result_data);
+//    // 11. Free memory and exit
+//    ggml_free(ctx_cgraph);
+//    ggml_gallocr_free(allocr);
+//    ggml_free(ctx);
+//    ggml_backend_buffer_free(buffer);
+//    ggml_backend_free(backend);
+//    fprintf(stderr, "[DEBUG] Cleaned up resources\n");
+//}
 
 static void debug_dump_img_embed(struct llava_context * ctx_llava) {
     fprintf(stderr, "[DEBUG] debug_dump_img_embed: Starting image embedding dump\n");
@@ -736,7 +736,7 @@ int main(int argc, char ** argv) {
         DEBUG_PRINT(&params, "Running debug tests (no image provided)\n");
         auto ctx_llava = llava_init_context(&params, model);
 
-        debug_test_mrope_2d();
+//        debug_test_mrope_2d();
         debug_dump_img_embed(ctx_llava);
 
         llama_perf_context_print(ctx_llava->ctx_llama);
