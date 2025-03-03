@@ -25,7 +25,7 @@
 #include <fstream>
 
 // Function to print debug messages only when debug flag is set
-#define DEBUG_PRINT(params, ...) do { if (false) { fprintf(stderr, "[DEBUG] "); fprintf(stderr, __VA_ARGS__); } } while (0)
+#define DEBUG_PRINT(params, ...) do { if ((params)->debug) { fprintf(stderr, "[DEBUG] "); fprintf(stderr, __VA_ARGS__); } } while (0)
 
 
 static bool qwen2vl_eval_image_embed(llama_context * ctx_llama, const struct llava_image_embed * image_embed,

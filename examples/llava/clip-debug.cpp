@@ -749,10 +749,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
     if (ctx->has_minicpmv_projector) {
         int pos_w = image_size_width/patch_size;
         int pos_h = image_size_height/patch_size;
-        if (ctx->is_qwen2_5) {
-            pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2048, pos_w * pos_h, 1);
-        }
-        else if (ctx->minicpmv_version == 2) {
+        if (ctx->minicpmv_version == 2) {
             pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 4096, pos_w * pos_h, 1);
         }
         else if (ctx->minicpmv_version == 3) {
@@ -1143,12 +1140,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                 const int d_head = 128;
                 int n_head = hidden_size/d_head;
                 int num_query = 96;
-                if (ctx->is_qwen2_5) {
-                    hidden_size = 2048;
-                    n_head = hidden_size/d_head;
-                    num_query = 64;
-                }
-                else if (ctx->minicpmv_version == 2) {
+                if (ctx->minicpmv_version == 2) {
                     hidden_size = 4096;
                     n_head = hidden_size/d_head;
                     num_query = 96;
@@ -1224,7 +1216,20 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             GGML_ABORT("fatel error");
         }
     } else if (ctx->proj_type == PROJECTOR_TYPE_MERGER) {
-        embeddings = ggml_reshape_3d(ctx0, embeddings, hidden_size * 4, num_positions / 4, batch_size);
+        // Current problematic code:
+        // embeddings = ggml_reshape_3d(ctx0, embeddings, hidden_size * 4, num_positions / 4, batch_size);
+
+        // Replace with this fixed code:
+        // Calculate the dimensions correctly based on the actual tensor dimensions
+        int64_t n_elements = ggml_nelements(embeddings);
+        int64_t dim0 = hidden_size * 4;
+        int64_t dim1 = n_elements / (dim0 * batch_size);
+
+        // Ensure we have a valid number of elements for reshaping
+        GGML_ASSERT(dim0 * dim1 * batch_size == n_elements);
+
+        // Now do the reshape with calculated dimensions
+        embeddings = ggml_reshape_3d(ctx0, embeddings, dim0, dim1, batch_size);
 
         embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
         embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
@@ -2479,18 +2484,24 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, cli
     }
     else if (ctx->has_qwen2vl_merger) {
         clip_image_u8 * resized = clip_image_u8_init();
-        auto patch_size = clip_patch_size(ctx) * 2;
-        int nx = ceil((float)img->nx / patch_size) * patch_size;
-        int ny = ceil((float)img->ny / patch_size) * patch_size;
+        auto patch_size = clip_patch_size(ctx);
+
+        // Calculate dimensions that are divisible by (patch_size * 2)
+        int required_multiple = patch_size * 2;
+
+        // Round up to the nearest multiple of required_multiple
+        int nx = ((img->nx + required_multiple - 1) / required_multiple) * required_multiple;
+        int ny = ((img->ny + required_multiple - 1) / required_multiple) * required_multiple;
+
+        LOG_INF("Resizing image from %dx%d to %dx%d to ensure divisibility by %d\n",
+                img->nx, img->ny, nx, ny, required_multiple);
+
         bicubic_resize(*img, *resized, nx, ny);
 
         res_imgs->data = new clip_image_f32[1];
-        // clip_image_f32 * res = clip_image_f32_init();
         normalize_image_u8_to_f32(resized, res_imgs->data, ctx->image_mean, ctx->image_std);
-        // res_imgs->data[0] = *res;
         res_imgs->size = 1;
 
-        // clip_image_f32_free(res);
         clip_image_u8_free(resized);
         return true;
     }
@@ -3219,10 +3230,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         return ctx->vision_model.mm_3_b->ne[0];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {
-        if (ctx->is_qwen2_5) {
-            return 2048;
-        }
-        else if (ctx->minicpmv_version == 2) {
+        if (ctx->minicpmv_version == 2) {
             return 4096;
         }
         else if (ctx->minicpmv_version == 3) {
@@ -3236,11 +3244,6 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         return ctx->vision_model.mm_model_mlp_3_w->ne[1];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_MERGER) {
-        // For Qwen2.5, the output dimension is 2048 instead of 3584
-        if (ctx->is_qwen2_5) {
-            LOG_INF("%s: Qwen2.5 detected, using output dimension 2048\n", __func__);
-            return 2048;
-        }
         return ctx->vision_model.mm_1_b->ne[0];
     }
 

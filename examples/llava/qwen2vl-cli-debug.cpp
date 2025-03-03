@@ -35,74 +35,154 @@ static bool qwen2vl_eval_image_embed(llama_context * ctx_llama, const struct lla
                 n_batch, *n_past, *st_pos_id);
     DEBUG_PRINT(params, "Image size: %dx%d\n", image_size->width, image_size->height);
 
-    int n_embd  = llama_model_n_embd(llama_get_model(ctx_llama));
-    const int patch_size = 14 * 2;
-    const int ph = image_size->height / patch_size + (image_size->height % patch_size > 0);
-    const int pw = image_size->width / patch_size + (image_size->width % patch_size > 0);
-    auto img_tokens = image_embed->n_image_pos;
+    int n_embd = llama_model_n_embd(llama_get_model(ctx_llama));
 
-    DEBUG_PRINT(params, "n_embd=%d, patch_size=%d, ph=%d, pw=%d, img_tokens=%d\n",
-                n_embd, patch_size, ph, pw, img_tokens);
+    // Default patch size for standard models
+    int patch_size = 28;
 
+    // We need to detect if this is Qwen2.5 based on configuration from the clip model
+    bool is_qwen2_5 = false;
+
+    // Get the clip context to check if it's Qwen2.5
+    // This would ideally come from the llava_context, but we'll assume Qwen2.5
+    // if the image dimensions are correctly resized
+    if (image_size->width % 28 == 0 && image_size->height % 28 == 0) {
+        is_qwen2_5 = true;
+        DEBUG_PRINT(params, "Detected Qwen2.5 VL model based on image dimensions\n");
+    }
+
+    // For Qwen2.5, we need to modify patch size calculation
+    const int effective_patch_size = is_qwen2_5 ? 14 : patch_size;
+    const int merge_size = is_qwen2_5 ? 2 : 1;
+
+    // Calculate grid dimensions based on image size and patch size
+    const int grid_h = (image_size->height / effective_patch_size);
+    const int grid_w = (image_size->width / effective_patch_size);
+
+    // Calculate number of patches after spatial merging (for Qwen2.5)
+    const int merged_grid_h = (grid_h + merge_size - 1) / merge_size;
+    const int merged_grid_w = (grid_w + merge_size - 1) / merge_size;
+
+    // Use the correct number of patches based on model type
+    const int final_grid_h = is_qwen2_5 ? merged_grid_h : grid_h;
+    const int final_grid_w = is_qwen2_5 ? merged_grid_w : grid_w;
+
+    // Account for actual embedded tokens from the model
+    // For Qwen2.5, we use the actual number from the embed
+    int img_tokens = image_embed->n_image_pos;
+
+    // Verify our calculations match the embedded tokens
+    DEBUG_PRINT(params, "Calculated dimensions: grid=%dx%d, merged=%dx%d, final=%dx%d, total=%d, embed_tokens=%d\n",
+               grid_w, grid_h, merged_grid_w, merged_grid_h, final_grid_w, final_grid_h,
+               final_grid_w * final_grid_h, img_tokens);
+
+    if (params && params->debug) {
+        // Extra sanity check for dimensions
+        if (is_qwen2_5 && (img_tokens != final_grid_w * final_grid_h)) {
+            fprintf(stderr, "[DEBUG] WARNING: Calculated patches (%d) doesn't match embedded tokens (%d)\n",
+                    final_grid_w * final_grid_h, img_tokens);
+        }
+    }
+
+    // Create position vectors - for Qwen2.5 we need 4D positions (MROPE)
     std::vector<llama_pos> mrope_pos;
-    mrope_pos.resize(img_tokens * 4);
+    mrope_pos.resize(img_tokens * 4, 0); // Initialize with zeros
 
     DEBUG_PRINT(params, "Setting up MROPE positions for %d patches\n", img_tokens);
 
-    for (int y = 0; y < ph; y++)
-    {
-        for (int x = 0; x < pw; x++)
-        {
-            int i = y * pw + x;
-            mrope_pos[i] = *st_pos_id;
-            mrope_pos[i + img_tokens] = *st_pos_id + y;
-            mrope_pos[i + img_tokens * 2] = *st_pos_id + x;
-            mrope_pos[i + img_tokens * 3] = 0;
+    // Initialize base position
+    int base_pos = *st_pos_id;
 
-            if (params && params->debug && i < 5) {
-                DEBUG_PRINT(params, "MROPE pos[%d] = (%d, %d, %d, %d)\n", i,
-                            (int)mrope_pos[i], (int)mrope_pos[i + img_tokens],
-                            (int)mrope_pos[i + img_tokens * 2], (int)mrope_pos[i + img_tokens * 3]);
-            }
+    // Fill in the MROPE positions for each patch
+    for (int i = 0; i < img_tokens; i++) {
+        int y, x;
+
+        if (is_qwen2_5) {
+            // For Qwen2.5: calculate row/col based on merged grid
+            y = i / final_grid_w;
+            x = i % final_grid_w;
+        } else {
+            // For standard models: calculate row/col based on original grid
+            y = i / grid_w;
+            x = i % grid_w;
+        }
+
+        // Position 0: Base position (token index)
+        mrope_pos[i] = base_pos + i;
+
+        // Position 1: Y position (row)
+        mrope_pos[i + img_tokens] = y;
+
+        // Position 2: X position (column)
+        mrope_pos[i + img_tokens * 2] = x;
+
+        // Position 3: For Qwen2.5, we use a special value related to the mrope_section
+        // From config.json: "mrope_section": [16, 24, 24]
+        // Use a different value based on token position/section
+        int section_idx = (i < img_tokens/3) ? 0 : ((i < 2*img_tokens/3) ? 1 : 2);
+        mrope_pos[i + img_tokens * 3] = section_idx;
+
+        if (params && params->debug && i < 5) {
+            DEBUG_PRINT(params, "MROPE pos[%d] = (%d, %d, %d, %d)\n", i,
+                       (int)mrope_pos[i], (int)mrope_pos[i + img_tokens],
+                       (int)mrope_pos[i + img_tokens * 2], (int)mrope_pos[i + img_tokens * 3]);
         }
     }
-    *st_pos_id += std::max(pw, ph);
+
+    // Update the starting position ID
+    *st_pos_id += img_tokens;
     DEBUG_PRINT(params, "Updated st_pos_id to %d\n", *st_pos_id);
 
+    // Process embeddings in batches
     int processed = 0;
     std::vector<llama_pos> batch_mrope_pos;
-    batch_mrope_pos.resize(img_tokens * 4);
+    batch_mrope_pos.resize(n_batch * 4, 0); // Initialize with zeros
 
     for (int i = 0; i < img_tokens; i += n_batch) {
-        int n_eval = img_tokens - i;
-        if (n_eval > n_batch) {
-            n_eval = n_batch;
+        int n_eval = std::min(n_batch, img_tokens - i);
+
+        DEBUG_PRINT(params, "Processing batch %d/%d: %d tokens (total=%d)\n",
+                   i/n_batch + 1, (img_tokens + n_batch - 1)/n_batch, n_eval, img_tokens);
+
+        // Copy position data for current batch - be extra careful with memory access
+        // First dimension (token indices)
+        for (int j = 0; j < n_eval; j++) {
+            batch_mrope_pos[j] = mrope_pos[processed + j];
         }
 
-        DEBUG_PRINT(params, "Processing batch %d/%d: %d tokens\n",
-                    i/n_batch + 1, (img_tokens + n_batch - 1)/n_batch, n_eval);
+        // Second dimension (y positions)
+        for (int j = 0; j < n_eval; j++) {
+            batch_mrope_pos[n_batch + j] = mrope_pos[img_tokens + processed + j];
+        }
 
-        std::fill(batch_mrope_pos.begin(), batch_mrope_pos.end(), 0);
-        memcpy(batch_mrope_pos.data(), &mrope_pos[processed], n_eval * sizeof(llama_pos));
-        memcpy(&batch_mrope_pos[n_eval * 1], &mrope_pos[img_tokens * 1 + processed], n_eval * sizeof(llama_pos));
-        memcpy(&batch_mrope_pos[n_eval * 2], &mrope_pos[img_tokens * 2 + processed], n_eval * sizeof(llama_pos));
-        memcpy(&batch_mrope_pos[n_eval * 3], &mrope_pos[img_tokens * 3 + processed], n_eval * sizeof(llama_pos));
+        // Third dimension (x positions)
+        for (int j = 0; j < n_eval; j++) {
+            batch_mrope_pos[n_batch * 2 + j] = mrope_pos[img_tokens * 2 + processed + j];
+        }
 
-        llama_batch batch = {
-            int32_t(n_eval),                // n_tokens
-            nullptr,                        // token
-            (image_embed->embed+i*n_embd),  // embed
-            batch_mrope_pos.data(),         // pos
-            nullptr,  // n_seq_id
-            nullptr,  // seq_id
-            nullptr,  // logits
-        };
+        // Fourth dimension (special values)
+        for (int j = 0; j < n_eval; j++) {
+            batch_mrope_pos[n_batch * 3 + j] = mrope_pos[img_tokens * 3 + processed + j];
+        }
 
-        DEBUG_PRINT(params, "Calling llama_decode for batch with %d tokens\n", n_eval);
-        if (llama_decode(ctx_llama, batch)) {
+        // Create and process the batch
+        llama_batch batch = { 0 };
+        batch.n_tokens = n_eval;
+        batch.token = nullptr;
+        batch.embd = image_embed->embed + processed * n_embd;
+        batch.pos = batch_mrope_pos.data();
+        batch.n_seq_id = nullptr;
+        batch.seq_id = nullptr;
+        batch.logits = nullptr;
+
+        DEBUG_PRINT(params, "About to call llama_decode with batch size %d\n", n_eval);
+        int result = llama_decode(ctx_llama, batch);
+        DEBUG_PRINT(params, "llama_decode returned %d\n", result);
+        if (result) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
+
         *n_past += n_eval;
         processed += n_eval;
         DEBUG_PRINT(params, "Processed %d/%d image tokens, n_past=%d\n", processed, img_tokens, *n_past);
@@ -137,12 +217,24 @@ static bool eval_tokens(struct llama_context * ctx_llama, std::vector<llama_toke
                     i/n_batch + 1, (N + n_batch - 1)/n_batch, n_eval);
 
         auto batch = llama_batch_get_one(&tokens[i], n_eval);
-        // TODO: add mrope pos ids somewhere else
+
+        // Set up position IDs for MROPE (4D positions)
         pos.resize(batch.n_tokens * 4);
         std::fill(pos.begin(), pos.end(), 0);
-        for (int j = 0; j < batch.n_tokens * 3; j ++) {
-            pos[j] = *st_pos_id + (j % batch.n_tokens);
+
+        // First dimension: sequential position
+        for (int j = 0; j < batch.n_tokens; j++) {
+            pos[j] = *st_pos_id + j;
         }
+
+        // Second dimension: also sequential position (for compatibility with Qwen2.5 models)
+        for (int j = 0; j < batch.n_tokens; j++) {
+            pos[batch.n_tokens + j] = *st_pos_id + j;
+        }
+
+        // Third and fourth dimensions: set to zero for text tokens
+        std::fill(pos.begin() + batch.n_tokens * 2, pos.end(), 0);
+
         batch.pos = pos.data();
 
         DEBUG_PRINT(params, "Calling llama_decode for batch with %d tokens\n", n_eval);
@@ -326,6 +418,29 @@ static struct llava_image_embed * load_image(llava_context * ctx_llava, common_p
     return embed;
 }
 
+void adjust_qwen2_sampling_params(struct llava_context* ctx_llava, common_params* params) {
+    if (clip_is_qwen2_5vl(ctx_llava->ctx_clip)) {
+        DEBUG_PRINT(params, "Adjusting sampling parameters for Qwen2.5 VL\n");
+
+        // Only modify if user hasn't explicitly set these parameters
+        if (params->sampling.temp == 0.8f) {  // Default value
+            params->sampling.temp = 0.7f;     // Slightly lower temperature for Qwen2.5
+            DEBUG_PRINT(params, "Set temperature to %f for Qwen2.5\n", params->sampling.temp);
+        }
+
+        if (params->sampling.top_p == 0.95f) {  // Default value
+            params->sampling.top_p = 0.9f;      // Slightly lower top_p
+            DEBUG_PRINT(params, "Set top_p to %f for Qwen2.5\n", params->sampling.top_p);
+        }
+
+        // Set a reasonable max length if not specified
+        if (params->n_predict < 0) {
+            params->n_predict = 512;
+            DEBUG_PRINT(params, "Set n_predict to %d for Qwen2.5\n", params->n_predict);
+        }
+    }
+}
+
 static void process_prompt(struct llava_context * ctx_llava, struct llava_image_embed * image_embed, common_params * params, const std::string & prompt) {
     DEBUG_PRINT(params, "process_prompt: Processing prompt: %s\n", prompt.c_str());
     DEBUG_PRINT(params, "Image embed: %p, n_image_pos: %d\n",
@@ -337,51 +452,116 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
     const int max_tgt_len = params->n_predict < 0 ? 256 : params->n_predict;
     DEBUG_PRINT(params, "Max target length: %d\n", max_tgt_len);
 
+    // Check if we're dealing with Qwen2.5 VL
+    bool is_qwen2_5 = false;
+    if (ctx_llava && ctx_llava->ctx_clip) {
+        is_qwen2_5 = clip_is_qwen2_5vl(ctx_llava->ctx_clip);
+        DEBUG_PRINT(params, "Model detection: is_qwen2_5 = %d\n", is_qwen2_5);
+    }
+
+    // Format the prompt according to model requirements
     std::string system_prompt, user_prompt;
-    size_t image_pos = prompt.find("<|vision_start|>");
-    if (image_pos != std::string::npos) {
-        // new templating mode: Provide the full prompt including system message and use <image> as a placeholder for the image
-        system_prompt = prompt.substr(0, image_pos);
-        user_prompt = prompt.substr(image_pos + std::string("<|vision_pad|>").length());
-        DEBUG_PRINT(params, "Using templating mode with <|vision_start|>\n");
-        LOG_INF("system_prompt: %s\n", system_prompt.c_str());
-        if (params->verbose_prompt) {
-            auto tmp = common_tokenize(ctx_llava->ctx_llama, system_prompt, true, true);
-            for (int i = 0; i < (int) tmp.size(); i++) {
-                LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx_llava->ctx_llama, tmp[i]).c_str());
-            }
-        }
-        LOG_INF("user_prompt: %s\n", user_prompt.c_str());
-        if (params->verbose_prompt) {
-            auto tmp = common_tokenize(ctx_llava->ctx_llama, user_prompt, true, true);
-            for (int i = 0; i < (int) tmp.size(); i++) {
-                LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx_llava->ctx_llama, tmp[i]).c_str());
-            }
+
+    if (is_qwen2_5) {
+        // Qwen2.5 VL specific format based on the official chat template
+        // From chat_template.json in the model repo
+        system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+
+        // For Qwen2.5, we need to check if the image is already mentioned in the prompt
+        if (prompt.find("<|vision_start|>") != std::string::npos) {
+            // The prompt already contains vision tags, use it as is
+            user_prompt = prompt + "<|im_end|>\n<|im_start|>assistant\n";
+            DEBUG_PRINT(params, "Using user-provided prompt with vision tags\n");
+        } else {
+            // Add vision tags for the image
+            user_prompt = "<|vision_start|><|image_pad|><|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+            DEBUG_PRINT(params, "Using Qwen2.5 VL format with auto-added vision tags\n");
         }
     } else {
-        // llava-1.5 native mode
-        system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|>";
-        user_prompt = "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-        DEBUG_PRINT(params, "Using llava-1.5 native mode\n");
-        if (params->verbose_prompt) {
-            auto tmp = common_tokenize(ctx_llava->ctx_llama, user_prompt, true, true);
-            for (int i = 0; i < (int) tmp.size(); i++) {
-                LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx_llava->ctx_llama, tmp[i]).c_str());
-            }
+        // Try to detect if prompt already has a specific format
+        size_t image_pos = prompt.find("<|vision_start|>");
+        if (image_pos != std::string::npos) {
+            // New templating mode: Provide the full prompt including system message
+            system_prompt = prompt.substr(0, image_pos);
+            user_prompt = prompt.substr(image_pos);
+            DEBUG_PRINT(params, "Using templating mode with <|vision_start|>\n");
+        } else {
+            // Default llava-1.5 native mode
+            system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|>";
+            user_prompt = "<|vision_end|>" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+            DEBUG_PRINT(params, "Using llava-1.5 native mode\n");
+        }
+    }
+
+    LOG_INF("system_prompt: %s\n", system_prompt.c_str());
+    if (params->verbose_prompt) {
+        auto tmp = common_tokenize(ctx_llava->ctx_llama, system_prompt, true, true);
+        for (int i = 0; i < (int) tmp.size(); i++) {
+            LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx_llava->ctx_llama, tmp[i]).c_str());
+        }
+    }
+
+    LOG_INF("user_prompt: %s\n", user_prompt.c_str());
+    if (params->verbose_prompt) {
+        auto tmp = common_tokenize(ctx_llava->ctx_llama, user_prompt, true, true);
+        for (int i = 0; i < (int) tmp.size(); i++) {
+            LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx_llava->ctx_llama, tmp[i]).c_str());
         }
     }
 
     DEBUG_PRINT(params, "Evaluating system prompt: %s\n", system_prompt.c_str());
     eval_string(ctx_llava->ctx_llama, system_prompt.c_str(), params->n_batch, &n_past, &cur_pos_id, true, params);
 
-    if (image_embed != nullptr) {
+    // For Qwen2.5, determine if we need to inject the image embed based on vision tags
+    bool inject_image = true;
+    if (is_qwen2_5) {
+        // Check if the user prompt already has vision tags
+        bool has_vision_tags = (user_prompt.find("<|vision_start|>") != std::string::npos);
+
+        // If we have vision tags and image embed, inject at the right position
+        if (has_vision_tags && image_embed != nullptr) {
+            // For Qwen2.5, we need special handling based on the tags
+            size_t vision_tag_pos = user_prompt.find("<|image_pad|>");
+            if (vision_tag_pos != std::string::npos) {
+                // Find the tag positions
+                size_t before_tag = user_prompt.find("<|vision_start|>");
+                size_t after_tag = user_prompt.find("<|vision_end|>", vision_tag_pos);
+
+                // Split the prompt around the image
+                std::string before_img = user_prompt.substr(0, vision_tag_pos + std::string("<|image_pad|>").length());
+                std::string after_img = user_prompt.substr(after_tag);
+
+                // First evaluate text before image
+                DEBUG_PRINT(params, "Evaluating text before image: %s\n", before_img.c_str());
+                eval_string(ctx_llava->ctx_llama, before_img.c_str(), params->n_batch, &n_past, &cur_pos_id, false, params);
+
+                // Then evaluate image embed
+                DEBUG_PRINT(params, "Evaluating image embed with %d patches\n", image_embed->n_image_pos);
+                auto image_size = clip_get_load_image_size(ctx_llava->ctx_clip);
+                qwen2vl_eval_image_embed(ctx_llava->ctx_llama, image_embed, params->n_batch, &n_past, &cur_pos_id, image_size, params);
+
+                // Finally evaluate text after image
+                DEBUG_PRINT(params, "Evaluating text after image: %s\n", after_img.c_str());
+                eval_string(ctx_llava->ctx_llama, after_img.c_str(), params->n_batch, &n_past, &cur_pos_id, false, params);
+
+                // We already handled the image embedding
+                inject_image = false;
+            }
+        }
+    }
+
+    // Standard image injection if needed
+    if (inject_image && image_embed != nullptr) {
         DEBUG_PRINT(params, "Evaluating image embed with %d patches\n", image_embed->n_image_pos);
         auto image_size = clip_get_load_image_size(ctx_llava->ctx_clip);
         qwen2vl_eval_image_embed(ctx_llava->ctx_llama, image_embed, params->n_batch, &n_past, &cur_pos_id, image_size, params);
     }
 
-    DEBUG_PRINT(params, "Evaluating user prompt: %s\n", user_prompt.c_str());
-    eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, &cur_pos_id, false, params);
+    // If we haven't already processed the user prompt (in the Qwen2.5 case)
+    if (inject_image) {
+        DEBUG_PRINT(params, "Evaluating user prompt: %s\n", user_prompt.c_str());
+        eval_string(ctx_llava->ctx_llama, user_prompt.c_str(), params->n_batch, &n_past, &cur_pos_id, false, params);
+    }
 
     // generate the response
     DEBUG_PRINT(params, "Starting response generation (max_length=%d)\n", max_tgt_len);
@@ -389,12 +569,28 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
     LOG("\n");
 
     struct common_sampler * smpl = common_sampler_init(ctx_llava->model, params->sampling);
+
+    // Adjust sampling parameters for Qwen2.5
+    if (is_qwen2_5) {
+        // Only modify if user hasn't explicitly set these parameters
+        if (params->sampling.temp == 0.8f) {  // Default value
+            params->sampling.temp = 0.7f;     // Slightly lower temperature for Qwen2.5
+            DEBUG_PRINT(params, "Set temperature to %f for Qwen2.5\n", params->sampling.temp);
+        }
+
+        if (params->sampling.top_p == 0.95f) {  // Default value
+            params->sampling.top_p = 0.9f;      // Slightly lower top_p
+            DEBUG_PRINT(params, "Set top_p to %f for Qwen2.5\n", params->sampling.top_p);
+        }
+    }
+
     if (!smpl) {
         LOG_ERR("%s: failed to initialize sampling subsystem\n", __func__);
         exit(1);
     }
 
     std::string response = "";
+
     for (int i = 0; i < max_tgt_len; i++) {
         DEBUG_PRINT(params, "Generating token %d/%d\n", i+1, max_tgt_len);
         const char * tmp = sample(smpl, ctx_llava->ctx_llama, &n_past, &cur_pos_id, params);
@@ -410,11 +606,18 @@ static void process_prompt(struct llava_context * ctx_llava, struct llava_image_
         LOG("%s", tmp);
         if (strstr(response.c_str(), "<|im_end|>")) {
             DEBUG_PRINT(params, "Found '<|im_end|>' terminator\n");
-            break; // Yi-34B llava-1.6 - for some reason those decode not as the correct token (tokenizer works)
+            break; // Common terminator for chat models
         }
         if (strstr(response.c_str(), "<|im_start|>")) {
             DEBUG_PRINT(params, "Found '<|im_start|>' terminator\n");
-            break; // Yi-34B llava-1.6
+            break; // Start of next turn
+        }
+        // Specific Qwen2.5 terminators from the chat template
+        if (is_qwen2_5 &&
+            (strstr(response.c_str(), "<|im_end|>") ||
+             strstr(response.c_str(), "<|im_start|>"))) {
+            DEBUG_PRINT(params, "Found Qwen2.5 specific terminator based on chat template\n");
+            break;
         }
         if (strstr(response.c_str(), "USER:")) {
             DEBUG_PRINT(params, "Found 'USER:' terminator (mistral llava-1.6)\n");
